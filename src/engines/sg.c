@@ -8,12 +8,75 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <errno.h>
-#include <assert.h>
-#include <sys/poll.h>
+#include <poll.h>
 
 #include "../fio.h"
+#include "../optgroup.h"
 
 #ifdef FIO_HAVE_SGIO
+
+enum {
+	FIO_SG_WRITE		= 1,
+	FIO_SG_WRITE_VERIFY	= 2,
+	FIO_SG_WRITE_SAME	= 3
+};
+
+struct sg_options {
+	void *pad;
+	unsigned int readfua;
+	unsigned int writefua;
+	unsigned int write_mode;
+};
+
+static struct fio_option options[] = {
+	{
+		.name	= "readfua",
+		.lname	= "sg engine read fua flag support",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct sg_options, readfua),
+		.help	= "Set FUA flag (force unit access) for all Read operations",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_SG,
+	},
+	{
+		.name	= "writefua",
+		.lname	= "sg engine write fua flag support",
+		.type	= FIO_OPT_BOOL,
+		.off1	= offsetof(struct sg_options, writefua),
+		.help	= "Set FUA flag (force unit access) for all Write operations",
+		.def	= "0",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_SG,
+	},
+	{
+		.name	= "sg_write_mode",
+		.lname	= "specify sg write mode",
+		.type	= FIO_OPT_STR,
+		.off1	= offsetof(struct sg_options, write_mode),
+		.help	= "Specify SCSI WRITE mode",
+		.def	= "write",
+		.posval = {
+			  { .ival = "write",
+			    .oval = FIO_SG_WRITE,
+			    .help = "Issue standard SCSI WRITE commands",
+			  },
+			  { .ival = "verify",
+			    .oval = FIO_SG_WRITE_VERIFY,
+			    .help = "Issue SCSI WRITE AND VERIFY commands",
+			  },
+			  { .ival = "same",
+			    .oval = FIO_SG_WRITE_SAME,
+			    .help = "Issue SCSI WRITE SAME commands",
+			  },
+		},
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_SG,
+	},
+	{
+		.name	= NULL,
+	},
+};
 
 #define MAX_10B_LBA  0xFFFFFFFFULL
 #define SCSI_TIMEOUT_MS 30000   // 30 second timeout; currently no method to override
@@ -203,8 +266,9 @@ re_read:
 	return r;
 }
 
-static int fio_sgio_ioctl_doio(struct thread_data *td,
-			       struct fio_file *f, struct io_u *io_u)
+static enum fio_q_status fio_sgio_ioctl_doio(struct thread_data *td,
+					     struct fio_file *f,
+					     struct io_u *io_u)
 {
 	struct sgio_data *sd = td->io_ops_data;
 	struct sg_io_hdr *hdr = &io_u->hdr;
@@ -254,11 +318,11 @@ static int fio_sgio_doio(struct thread_data *td, struct io_u *io_u, int do_sync)
 
 	if (f->filetype == FIO_TYPE_BLOCK) {
 		ret = fio_sgio_ioctl_doio(td, f, io_u);
-		td->error = io_u->error;
+		td_verror(td, io_u->error, __func__);
 	} else {
 		ret = fio_sgio_rw_doio(f, io_u, do_sync);
 		if (do_sync)
-			td->error = io_u->error;
+			td_verror(td, io_u->error, __func__);
 	}
 
 	return ret;
@@ -267,6 +331,7 @@ static int fio_sgio_doio(struct thread_data *td, struct io_u *io_u, int do_sync)
 static int fio_sgio_prep(struct thread_data *td, struct io_u *io_u)
 {
 	struct sg_io_hdr *hdr = &io_u->hdr;
+	struct sg_options *o = td->eo;
 	struct sgio_data *sd = td->io_ops_data;
 	long long nr_blocks, lba;
 
@@ -286,14 +351,38 @@ static int fio_sgio_prep(struct thread_data *td, struct io_u *io_u)
 			hdr->cmdp[0] = 0x28; // read(10)
 		else
 			hdr->cmdp[0] = 0x88; // read(16)
+
+		if (o->readfua)
+			hdr->cmdp[1] |= 0x08;
+
 	} else if (io_u->ddir == DDIR_WRITE) {
 		sgio_hdr_init(sd, hdr, io_u, 1);
 
 		hdr->dxfer_direction = SG_DXFER_TO_DEV;
-		if (lba < MAX_10B_LBA)
-			hdr->cmdp[0] = 0x2a; // write(10)
-		else
-			hdr->cmdp[0] = 0x8a; // write(16)
+		switch(o->write_mode) {
+		case FIO_SG_WRITE:
+			if (lba < MAX_10B_LBA)
+				hdr->cmdp[0] = 0x2a; // write(10)
+			else
+				hdr->cmdp[0] = 0x8a; // write(16)
+			if (o->writefua)
+				hdr->cmdp[1] |= 0x08;
+			break;
+		case FIO_SG_WRITE_VERIFY:
+			if (lba < MAX_10B_LBA)
+				hdr->cmdp[0] = 0x2e; // write and verify(10)
+			else
+				hdr->cmdp[0] = 0x8e; // write and verify(16)
+			break;
+			// BYTCHK is disabled by virtue of the memset in sgio_hdr_init
+		case FIO_SG_WRITE_SAME:
+			hdr->dxfer_len = sd->bs;
+			if (lba < MAX_10B_LBA)
+				hdr->cmdp[0] = 0x41; // write same(10)
+			else
+				hdr->cmdp[0] = 0x93; // write same(16)
+			break;
+		};
 	} else {
 		sgio_hdr_init(sd, hdr, io_u, 0);
 		hdr->dxfer_direction = SG_DXFER_NONE;
@@ -335,7 +424,8 @@ static int fio_sgio_prep(struct thread_data *td, struct io_u *io_u)
 	return 0;
 }
 
-static int fio_sgio_queue(struct thread_data *td, struct io_u *io_u)
+static enum fio_q_status fio_sgio_queue(struct thread_data *td,
+					struct io_u *io_u)
 {
 	struct sg_io_hdr *hdr = &io_u->hdr;
 	int ret, do_sync = 0;
@@ -413,8 +503,10 @@ static int fio_sgio_read_capacity(struct thread_data *td, unsigned int *bs,
 		return ret;
 	}
 
-	*bs	 = (buf[4] << 24) | (buf[5] << 16) | (buf[6] << 8) | buf[7];
-	*max_lba = ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) & MAX_10B_LBA;  // for some reason max_lba is being sign extended even though unsigned.
+	*bs	 = ((unsigned long) buf[4] << 24) | ((unsigned long) buf[5] << 16) |
+		   ((unsigned long) buf[6] << 8) | (unsigned long) buf[7];
+	*max_lba = ((unsigned long) buf[0] << 24) | ((unsigned long) buf[1] << 16) |
+		   ((unsigned long) buf[2] << 8) | (unsigned long) buf[3];
 
 	/*
 	 * If max lba masked by MAX_10B_LBA equals MAX_10B_LBA,
@@ -822,6 +914,8 @@ static struct ioengine_ops ioengine = {
 	.close_file	= generic_close_file,
 	.get_file_size	= fio_sgio_get_file_size,
 	.flags		= FIO_SYNCIO | FIO_RAWIO,
+	.options	= options,
+	.option_struct_size	= sizeof(struct sg_options)
 };
 
 #else /* FIO_HAVE_SGIO */

@@ -10,11 +10,19 @@
 #include <sys/sysctl.h>
 #include <sys/statvfs.h>
 #include <sys/diskslice.h>
-#include <sys/ioctl_compat.h>
 #include <sys/usched.h>
 #include <sys/resource.h>
 
+/* API changed during "5.3 development" */
+#if __DragonFly_version < 500302
+#include <sys/ioctl_compat.h>
+#define DAIOCTRIM	IOCTLTRIM
+#else
+#include <bus/cam/scsi/scsi_daio.h>
+#endif
+
 #include "../file.h"
+#include "../lib/types.h"
 
 #define FIO_HAVE_ODIRECT
 #define FIO_USE_GENERIC_RAND
@@ -107,12 +115,9 @@ static inline void fio_cpu_set(os_cpu_mask_t *mask, int cpu)
 	CPUMASK_ORBIT(*mask, cpu);
 }
 
-static inline int fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
+static inline bool fio_cpu_isset(os_cpu_mask_t *mask, int cpu)
 {
-	if (CPUMASK_TESTBIT(*mask, cpu))
-		return 1;
-
-	return 0;
+	return CPUMASK_TESTBIT(*mask, cpu) != 0;
 }
 
 static inline int fio_setaffinity(int pid, os_cpu_mask_t mask)
@@ -224,7 +229,7 @@ static inline int os_trim(struct fio_file *f, unsigned long long start,
 	range[0] = start;
 	range[1] = len;
 
-	if (!ioctl(f->fd, IOCTLTRIM, range))
+	if (!ioctl(f->fd, DAIOCTRIM, range))
 		return 0;
 
 	return errno;

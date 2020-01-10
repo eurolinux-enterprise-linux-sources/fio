@@ -3,7 +3,6 @@
 
 #include "compiler/compiler.h"
 #include "os/os.h"
-#include "log.h"
 #include "io_ddir.h"
 #include "debug.h"
 #include "file.h"
@@ -114,9 +113,6 @@ struct io_u {
 #ifdef CONFIG_SOLARISAIO
 		aio_result_t resultp;
 #endif
-#ifdef FIO_HAVE_BINJECT
-		struct b_user_cmd buc;
-#endif
 #ifdef CONFIG_RDMA
 		struct ibv_mr *mr;
 #endif
@@ -152,12 +148,17 @@ static inline void dprint_io_u(struct io_u *io_u, const char *p)
 {
 	struct fio_file *f = io_u->file;
 
-	dprint(FD_IO, "%s: io_u %p: off=%llu/len=%lu/ddir=%d", p, io_u,
-					(unsigned long long) io_u->offset,
-					io_u->buflen, io_u->ddir);
 	if (f)
-		dprint(FD_IO, "/%s", f->file_name);
-	dprint(FD_IO, "\n");
+		dprint(FD_IO, "%s: io_u %p: off=0x%llx,len=0x%lx,ddir=%d,file=%s\n",
+				p, io_u,
+				(unsigned long long) io_u->offset,
+				io_u->buflen, io_u->ddir,
+				f->file_name);
+	else
+		dprint(FD_IO, "%s: io_u %p: off=0x%llx,len=0x%lx,ddir=%d\n",
+				p, io_u,
+				(unsigned long long) io_u->offset,
+				io_u->buflen, io_u->ddir);
 }
 #else
 #define dprint_io_u(io_u, p)

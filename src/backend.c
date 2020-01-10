@@ -18,33 +18,21 @@
  *
  *  You should have received a copy of the GNU General Public License
  *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+ *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  *
  */
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
-#include <limits.h>
 #include <signal.h>
-#include <time.h>
-#include <locale.h>
 #include <assert.h>
-#include <time.h>
 #include <inttypes.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <sys/ipc.h>
-#include <sys/mman.h>
 #include <math.h>
 
 #include "fio.h"
-#ifndef FIO_NO_HAVE_SHM_H
-#include <sys/shm.h>
-#endif
-#include "hash.h"
 #include "smalloc.h"
 #include "verify.h"
-#include "trim.h"
 #include "diskutil.h"
 #include "cgroup.h"
 #include "profile.h"
@@ -58,8 +46,9 @@
 #include "lib/mountcheck.h"
 #include "rate-submit.h"
 #include "helper_thread.h"
+#include "pshared.h"
 
-static struct fio_mutex *startup_mutex;
+static struct fio_sem *startup_sem;
 static struct flist_head *cgroup_list;
 static char *cgroup_mnt;
 static int exit_value;
@@ -279,7 +268,7 @@ static void cleanup_pending_aio(struct thread_data *td)
 static bool fio_io_sync(struct thread_data *td, struct fio_file *f)
 {
 	struct io_u *io_u = __get_io_u(td);
-	int ret;
+	enum fio_q_status ret;
 
 	if (!io_u)
 		return true;
@@ -294,16 +283,13 @@ static bool fio_io_sync(struct thread_data *td, struct fio_file *f)
 
 requeue:
 	ret = td_io_queue(td, io_u);
-	if (ret < 0) {
-		td_verror(td, io_u->error, "td_io_queue");
-		put_io_u(td, io_u);
-		return true;
-	} else if (ret == FIO_Q_QUEUED) {
-		if (td_io_commit(td))
-			return true;
+	switch (ret) {
+	case FIO_Q_QUEUED:
+		td_io_commit(td);
 		if (io_u_queued_complete(td, 1) < 0)
 			return true;
-	} else if (ret == FIO_Q_COMPLETED) {
+		break;
+	case FIO_Q_COMPLETED:
 		if (io_u->error) {
 			td_verror(td, io_u->error, "td_io_queue");
 			return true;
@@ -311,9 +297,9 @@ requeue:
 
 		if (io_u_sync_complete(td, io_u) < 0)
 			return true;
-	} else if (ret == FIO_Q_BUSY) {
-		if (td_io_commit(td))
-			return true;
+		break;
+	case FIO_Q_BUSY:
+		td_io_commit(td);
 		goto requeue;
 	}
 
@@ -426,7 +412,7 @@ static void check_update_rusage(struct thread_data *td)
 	if (td->update_rusage) {
 		td->update_rusage = 0;
 		update_rusage_stat(td);
-		fio_mutex_up(td->rusage_sem);
+		fio_sem_up(td->rusage_sem);
 	}
 }
 
@@ -464,8 +450,6 @@ int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 		   enum fio_ddir ddir, uint64_t *bytes_issued, int from_verify,
 		   struct timespec *comp_time)
 {
-	int ret2;
-
 	switch (*ret) {
 	case FIO_Q_COMPLETED:
 		if (io_u->error) {
@@ -499,7 +483,6 @@ int io_queue_event(struct thread_data *td, struct io_u *io_u, int *ret,
 			if (ddir_rw(io_u->ddir))
 				td->ts.short_io_u[io_u->ddir]++;
 
-			f = io_u->file;
 			if (io_u->offset == f->real_file_size)
 				goto sync_done;
 
@@ -542,9 +525,7 @@ sync_done:
 		if (!from_verify)
 			unlog_io_piece(td, io_u);
 		requeue_io_u(td, &io_u);
-		ret2 = td_io_commit(td);
-		if (ret2 < 0)
-			*ret = ret2;
+		td_io_commit(td);
 		break;
 	default:
 		assert(*ret < 0);
@@ -617,7 +598,7 @@ static bool in_flight_overlap(struct io_u_queue *q, struct io_u *io_u)
 	return overlap;
 }
 
-static int io_u_submit(struct thread_data *td, struct io_u *io_u)
+static enum fio_q_status io_u_submit(struct thread_data *td, struct io_u *io_u)
 {
 	/*
 	 * Check for overlap if the user asked us to, and we have
@@ -735,6 +716,7 @@ static void do_verify(struct thread_data *td, uint64_t verify_bytes)
 					break;
 				} else if (io_u->ddir == DDIR_WRITE) {
 					io_u->ddir = DDIR_READ;
+					populate_verify_io_u(td, io_u);
 					break;
 				} else {
 					put_io_u(td, io_u);
@@ -845,14 +827,13 @@ static bool io_complete_bytes_exceeded(struct thread_data *td)
  */
 static long long usec_for_io(struct thread_data *td, enum fio_ddir ddir)
 {
-	uint64_t secs, remainder, bps, bytes, iops;
+	uint64_t bps = td->rate_bps[ddir];
 
 	assert(!(td->flags & TD_F_CHILD));
-	bytes = td->rate_io_issue_bytes[ddir];
-	bps = td->rate_bps[ddir];
 
 	if (td->o.rate_process == RATE_PROCESS_POISSON) {
-		uint64_t val;
+		uint64_t val, iops;
+
 		iops = bps / td->o.bs[ddir];
 		val = (int64_t) (1000000 / iops) *
 				-logf(__rand_0_1(&td->poisson_state[ddir]));
@@ -864,12 +845,54 @@ static long long usec_for_io(struct thread_data *td, enum fio_ddir ddir)
 		td->last_usec[ddir] += val;
 		return td->last_usec[ddir];
 	} else if (bps) {
-		secs = bytes / bps;
-		remainder = bytes % bps;
+		uint64_t bytes = td->rate_io_issue_bytes[ddir];
+		uint64_t secs = bytes / bps;
+		uint64_t remainder = bytes % bps;
+
 		return remainder * 1000000 / bps + secs * 1000000;
 	}
 
 	return 0;
+}
+
+static void handle_thinktime(struct thread_data *td, enum fio_ddir ddir)
+{
+	unsigned long long b;
+	uint64_t total;
+	int left;
+
+	b = ddir_rw_sum(td->io_blocks);
+	if (b % td->o.thinktime_blocks)
+		return;
+
+	io_u_quiesce(td);
+
+	total = 0;
+	if (td->o.thinktime_spin)
+		total = usec_spin(td->o.thinktime_spin);
+
+	left = td->o.thinktime - total;
+	if (left)
+		total += usec_sleep(td, left);
+
+	/*
+	 * If we're ignoring thinktime for the rate, add the number of bytes
+	 * we would have done while sleeping, minus one block to ensure we
+	 * start issuing immediately after the sleep.
+	 */
+	if (total && td->rate_bps[ddir] && td->o.rate_ign_think) {
+		uint64_t missed = (td->rate_bps[ddir] * total) / 1000000ULL;
+		uint64_t bs = td->o.min_bs[ddir];
+		uint64_t usperop = bs * 1000000ULL / td->rate_bps[ddir];
+		uint64_t over;
+
+		if (usperop <= total)
+			over = bs;
+		else
+			over = (usperop - total) / usperop * -bs;
+
+		td->rate_io_issue_bytes[ddir] += (missed - over);
+	}
 }
 
 /*
@@ -956,6 +979,7 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 			int err = PTR_ERR(io_u);
 
 			io_u = NULL;
+			ddir = DDIR_INVAL;
 			if (err == -EBUSY) {
 				ret = FIO_Q_BUSY;
 				goto reap;
@@ -964,6 +988,9 @@ static void do_io(struct thread_data *td, uint64_t *bytes_done)
 				goto reap;
 			break;
 		}
+
+		if (io_u->ddir == DDIR_WRITE && td->flags & TD_F_DO_VERIFY)
+			populate_verify_io_u(td, io_u);
 
 		ddir = io_u->ddir;
 
@@ -1063,23 +1090,8 @@ reap:
 		if (!in_ramp_time(td) && td->o.latency_target)
 			lat_target_check(td);
 
-		if (td->o.thinktime) {
-			unsigned long long b;
-
-			b = ddir_rw_sum(td->io_blocks);
-			if (!(b % td->o.thinktime_blocks)) {
-				int left;
-
-				io_u_quiesce(td);
-
-				if (td->o.thinktime_spin)
-					usec_spin(td->o.thinktime_spin);
-
-				left = td->o.thinktime - td->o.thinktime_spin;
-				if (left)
-					usec_sleep(td, left);
-			}
-		}
+		if (ddir_rw(ddir) && td->o.thinktime)
+			handle_thinktime(td, ddir);
 	}
 
 	check_update_rusage(td);
@@ -1204,9 +1216,9 @@ static int init_io_u(struct thread_data *td)
 		data_xfer = 0;
 
 	err = 0;
-	err += io_u_rinit(&td->io_u_requeues, td->o.iodepth);
-	err += io_u_qinit(&td->io_u_freelist, td->o.iodepth);
-	err += io_u_qinit(&td->io_u_all, td->o.iodepth);
+	err += !io_u_rinit(&td->io_u_requeues, td->o.iodepth);
+	err += !io_u_qinit(&td->io_u_freelist, td->o.iodepth);
+	err += !io_u_qinit(&td->io_u_all, td->o.iodepth);
 
 	if (err) {
 		log_err("fio: failed setting up IO queues\n");
@@ -1313,7 +1325,7 @@ static int init_io_u(struct thread_data *td)
 static int switch_ioscheduler(struct thread_data *td)
 {
 #ifdef FIO_HAVE_IOSCHED_SWITCH
-	char tmp[256], tmp2[128];
+	char tmp[256], tmp2[128], *p;
 	FILE *f;
 	int ret;
 
@@ -1349,17 +1361,19 @@ static int switch_ioscheduler(struct thread_data *td)
 	/*
 	 * Read back and check that the selected scheduler is now the default.
 	 */
-	memset(tmp, 0, sizeof(tmp));
-	ret = fread(tmp, sizeof(tmp), 1, f);
+	ret = fread(tmp, 1, sizeof(tmp) - 1, f);
 	if (ferror(f) || ret < 0) {
 		td_verror(td, errno, "fread");
 		fclose(f);
 		return 1;
 	}
+	tmp[ret] = '\0';
 	/*
-	 * either a list of io schedulers or "none\n" is expected.
+	 * either a list of io schedulers or "none\n" is expected. Strip the
+	 * trailing newline.
 	 */
-	tmp[strlen(tmp) - 1] = '\0';
+	p = tmp;
+	strsep(&p, "\n");
 
 	/*
 	 * Write to "none" entry doesn't fail, so check the result here.
@@ -1505,7 +1519,7 @@ static void *thread_main(void *data)
 	struct sk_out *sk_out = fd->sk_out;
 	uint64_t bytes_done[DDIR_RWDIR_CNT];
 	int deadlock_loop_cnt;
-	int clear_state;
+	bool clear_state, did_some_io;
 	int ret;
 
 	sk_out_assign(sk_out);
@@ -1528,7 +1542,6 @@ static void *thread_main(void *data)
 	INIT_FLIST_HEAD(&td->io_hist_list);
 	INIT_FLIST_HEAD(&td->verify_list);
 	INIT_FLIST_HEAD(&td->trim_list);
-	INIT_FLIST_HEAD(&td->next_rand_list);
 	td->io_hist_tree = RB_ROOT;
 
 	ret = mutex_cond_init_pshared(&td->io_u_lock, &td->free_cond);
@@ -1543,11 +1556,11 @@ static void *thread_main(void *data)
 	}
 
 	td_set_runstate(td, TD_INITIALIZED);
-	dprint(FD_MUTEX, "up startup_mutex\n");
-	fio_mutex_up(startup_mutex);
-	dprint(FD_MUTEX, "wait on td->mutex\n");
-	fio_mutex_down(td->mutex);
-	dprint(FD_MUTEX, "done waiting on td->mutex\n");
+	dprint(FD_MUTEX, "up startup_sem\n");
+	fio_sem_up(startup_sem);
+	dprint(FD_MUTEX, "wait on td->sem\n");
+	fio_sem_down(td->sem);
+	dprint(FD_MUTEX, "done waiting on td->sem\n");
 
 	/*
 	 * A new gid requires privilege, so we need to do this before setting
@@ -1657,7 +1670,7 @@ static void *thread_main(void *data)
 	 * May alter parameters that init_io_u() will use, so we need to
 	 * do this first.
 	 */
-	if (init_iolog(td))
+	if (!init_iolog(td))
 		goto err;
 
 	if (init_io_u(td))
@@ -1693,16 +1706,14 @@ static void *thread_main(void *data)
 	if (td_io_init(td))
 		goto err;
 
-	if (init_random_map(td))
+	if (!init_random_map(td))
 		goto err;
 
 	if (o->exec_prerun && exec_string(o, o->exec_prerun, (const char *)"prerun"))
 		goto err;
 
-	if (o->pre_read) {
-		if (pre_read_files(td) < 0)
-			goto err;
-	}
+	if (o->pre_read && !pre_read_files(td))
+		goto err;
 
 	fio_verify_init(td);
 
@@ -1726,7 +1737,8 @@ static void *thread_main(void *data)
 	}
 
 	memset(bytes_done, 0, sizeof(bytes_done));
-	clear_state = 0;
+	clear_state = false;
+	did_some_io = false;
 
 	while (keep_running(td)) {
 		uint64_t verify_bytes;
@@ -1765,7 +1777,7 @@ static void *thread_main(void *data)
 		if (td->runstate >= TD_EXITED)
 			break;
 
-		clear_state = 1;
+		clear_state = true;
 
 		/*
 		 * Make sure we've successfully updated the rusage stats
@@ -1777,11 +1789,11 @@ static void *thread_main(void *data)
 		deadlock_loop_cnt = 0;
 		do {
 			check_update_rusage(td);
-			if (!fio_mutex_down_trylock(stat_mutex))
+			if (!fio_sem_down_trylock(stat_sem))
 				break;
 			usleep(1000);
 			if (deadlock_loop_cnt++ > 5000) {
-				log_err("fio seems to be stuck grabbing stat_mutex, forcibly exiting\n");
+				log_err("fio seems to be stuck grabbing stat_sem, forcibly exiting\n");
 				td->error = EDEADLK;
 				goto err;
 			}
@@ -1794,7 +1806,7 @@ static void *thread_main(void *data)
 		if (td_trim(td) && td->io_bytes[DDIR_TRIM])
 			update_runtime(td, elapsed_us, DDIR_TRIM);
 		fio_gettime(&td->start, NULL);
-		fio_mutex_up(stat_mutex);
+		fio_sem_up(stat_sem);
 
 		if (td->error || td->terminate)
 			break;
@@ -1803,6 +1815,9 @@ static void *thread_main(void *data)
 		    o->verify == VERIFY_NONE ||
 		    td_ioengine_flagged(td, FIO_UNIDIR))
 			continue;
+
+		if (ddir_rw_sum(bytes_done))
+			did_some_io = true;
 
 		clear_io_state(td, 0);
 
@@ -1815,10 +1830,10 @@ static void *thread_main(void *data)
 		 */
 		check_update_rusage(td);
 
-		fio_mutex_down(stat_mutex);
+		fio_sem_down(stat_sem);
 		update_runtime(td, elapsed_us, DDIR_READ);
 		fio_gettime(&td->start, NULL);
-		fio_mutex_up(stat_mutex);
+		fio_sem_up(stat_sem);
 
 		if (td->error || td->terminate)
 			break;
@@ -1830,6 +1845,7 @@ static void *thread_main(void *data)
 	 * (Are we not missing other flags that can be ignored ?)
 	 */
 	if ((td->o.size || td->o.io_size) && !ddir_rw_sum(bytes_done) &&
+	    !did_some_io && !td->o.create_only &&
 	    !(td_ioengine_flagged(td, FIO_NOIO) ||
 	      td_ioengine_flagged(td, FIO_DISKLESSIO)))
 		log_err("%s: No I/O performed by %s, "
@@ -1925,11 +1941,7 @@ static void reap_threads(unsigned int *nr_running, uint64_t *t_rate,
 	for_each_td(td, i) {
 		int flags = 0;
 
-		/*
-		 * ->io_ops is NULL for a thread that has closed its
-		 * io engine
-		 */
-		if (td->io_ops && !strcmp(td->io_ops->name, "cpuio"))
+		 if (!strcmp(td->o.ioengine, "cpuio"))
 			cputhreads++;
 		else
 			realthreads++;
@@ -2292,7 +2304,7 @@ reap:
 
 			init_disk_util(td);
 
-			td->rusage_sem = fio_mutex_init(FIO_MUTEX_LOCKED);
+			td->rusage_sem = fio_sem_init(FIO_SEM_LOCKED);
 			td->update_rusage = 0;
 
 			/*
@@ -2320,6 +2332,7 @@ reap:
 					nr_started--;
 					break;
 				}
+				fd = NULL;
 				ret = pthread_detach(td->thread);
 				if (ret)
 					log_err("pthread_detach: %s",
@@ -2336,15 +2349,16 @@ reap:
 				} else if (i == fio_debug_jobno)
 					*fio_debug_jobp = pid;
 			}
-			dprint(FD_MUTEX, "wait on startup_mutex\n");
-			if (fio_mutex_down_timeout(startup_mutex, 10000)) {
+			dprint(FD_MUTEX, "wait on startup_sem\n");
+			if (fio_sem_down_timeout(startup_sem, 10000)) {
 				log_err("fio: job startup hung? exiting.\n");
 				fio_terminate_threads(TERMINATE_ALL);
 				fio_abort = 1;
 				nr_started--;
+				free(fd);
 				break;
 			}
-			dprint(FD_MUTEX, "done waiting on startup_mutex\n");
+			dprint(FD_MUTEX, "done waiting on startup_sem\n");
 		}
 
 		/*
@@ -2403,7 +2417,7 @@ reap:
 			m_rate += ddir_rw_sum(td->o.ratemin);
 			t_rate += ddir_rw_sum(td->o.rate);
 			todo--;
-			fio_mutex_up(td->mutex);
+			fio_sem_up(td->sem);
 		}
 
 		reap_threads(&nr_running, &t_rate, &m_rate);
@@ -2452,16 +2466,17 @@ int fio_backend(struct sk_out *sk_out)
 		setup_log(&agg_io_log[DDIR_TRIM], &p, "agg-trim_bw.log");
 	}
 
-	startup_mutex = fio_mutex_init(FIO_MUTEX_LOCKED);
-	if (startup_mutex == NULL)
+	startup_sem = fio_sem_init(FIO_SEM_LOCKED);
+	if (startup_sem == NULL)
 		return 1;
 
 	set_genesis_time();
 	stat_init();
-	helper_thread_create(startup_mutex, sk_out);
+	helper_thread_create(startup_sem, sk_out);
 
 	cgroup_list = smalloc(sizeof(*cgroup_list));
-	INIT_FLIST_HEAD(cgroup_list);
+	if (cgroup_list)
+		INIT_FLIST_HEAD(cgroup_list);
 
 	run_threads(sk_out);
 
@@ -2480,27 +2495,24 @@ int fio_backend(struct sk_out *sk_out)
 	}
 
 	for_each_td(td, i) {
-		if (td->ss.dur) {
-			if (td->ss.iops_data != NULL) {
-				free(td->ss.iops_data);
-				free(td->ss.bw_data);
-			}
-		}
+		steadystate_free(td);
 		fio_options_free(td);
 		if (td->rusage_sem) {
-			fio_mutex_remove(td->rusage_sem);
+			fio_sem_remove(td->rusage_sem);
 			td->rusage_sem = NULL;
 		}
-		fio_mutex_remove(td->mutex);
-		td->mutex = NULL;
+		fio_sem_remove(td->sem);
+		td->sem = NULL;
 	}
 
 	free_disk_util();
-	cgroup_kill(cgroup_list);
-	sfree(cgroup_list);
+	if (cgroup_list) {
+		cgroup_kill(cgroup_list);
+		sfree(cgroup_list);
+	}
 	sfree(cgroup_mnt);
 
-	fio_mutex_remove(startup_mutex);
+	fio_sem_remove(startup_sem);
 	stat_exit();
 	return exit_value;
 }

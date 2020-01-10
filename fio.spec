@@ -1,6 +1,6 @@
 Name:		fio
-Version:	3.1
-Release:	2%{?dist}
+Version:	3.7
+Release:	1%{?dist}
 Summary:	Multithreaded IO generation tool
 
 Group:		Applications/System
@@ -54,6 +54,10 @@ rm -rf $RPM_BUILD_ROOT
 %{_datadir}/%{name}/*
 
 %changelog
+* Mon Feb 25 2019 Eric Sandeen <sandeen@redhat.com> 3.7-1
+- New upstream version
+- Adds libpmem ioengine (#1672362)
+
 * Tue Oct 24 2017 Eric Sandeen <sandeen@redhat.com> 3.1-2
 - Add new build deps for more features
 

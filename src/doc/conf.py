@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
 # fio documentation build configuration file, created by
@@ -22,6 +21,9 @@
 # sys.path.insert(0, os.path.abspath('.'))
 
 # -- General configuration ------------------------------------------------
+
+from __future__ import absolute_import
+from __future__ import print_function
 
 # If your documentation needs a minimal Sphinx version, state it here.
 #

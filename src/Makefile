@@ -4,19 +4,18 @@ endif
 
 VPATH := $(SRCDIR)
 
-ifneq ($(wildcard config-host.mak),)
-all:
-include config-host.mak
-config-host-mak: configure
-	@echo $@ is out-of-date, running configure
-	@sed -n "/.*Configured with/s/[^:]*: //p" $@ | sh
-else
-config-host.mak:
+all: fio
+
+config-host.mak: configure
+	@if [ ! -e "$@" ]; then					\
+	  echo "Running configure ...";				\
+	  ./configure;						\
+	else							\
+	  echo "$@ is out-of-date, running configure";		\
+	  sed -n "/.*Configured with/s/[^:]*: //p" "$@" | sh;	\
+	fi
+
 ifneq ($(MAKECMDGOALS),clean)
-	@echo "Running configure for you..."
-	@./configure
-endif
-all:
 include config-host.mak
 endif
 
@@ -31,6 +30,9 @@ SCRIPTS = $(addprefix $(SRCDIR)/,tools/fio_generate_plots tools/plot/fio2gnuplot
 ifndef CONFIG_FIO_NO_OPT
   CFLAGS += -O3 -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=2
 endif
+ifdef CONFIG_BUILD_NATIVE
+  CFLAGS += -march=native
+endif
 
 ifdef CONFIG_GFIO
   PROGS += gfio
@@ -39,10 +41,11 @@ endif
 SOURCE :=	$(sort $(patsubst $(SRCDIR)/%,%,$(wildcard $(SRCDIR)/crc/*.c)) \
 		$(patsubst $(SRCDIR)/%,%,$(wildcard $(SRCDIR)/lib/*.c))) \
 		gettime.c ioengines.c init.c stat.c log.c time.c filesetup.c \
-		eta.c verify.c memory.c io_u.c parse.c mutex.c options.c \
+		eta.c verify.c memory.c io_u.c parse.c fio_sem.c rwlock.c \
+		pshared.c options.c \
 		smalloc.c filehash.c profile.c debug.c engines/cpu.c \
 		engines/mmap.c engines/sync.c engines/null.c engines/net.c \
-		engines/ftruncate.c \
+		engines/ftruncate.c engines/filecreate.c \
 		server.c client.c iolog.c backend.c libfio.c flow.c cconv.c \
 		gettime-thread.c helpers.c json.c idletime.c td_error.c \
 		profiles/tiobench.c profiles/act.c io_u_queue.c filelock.c \
@@ -51,14 +54,11 @@ SOURCE :=	$(sort $(patsubst $(SRCDIR)/%,%,$(wildcard $(SRCDIR)/crc/*.c)) \
 
 ifdef CONFIG_LIBHDFS
   HDFSFLAGS= -I $(JAVA_HOME)/include -I $(JAVA_HOME)/include/linux -I $(FIO_LIBHDFS_INCLUDE)
-  HDFSLIB= -Wl,-rpath $(JAVA_HOME)/jre/lib/$(FIO_HDFS_CPU)/server -L$(JAVA_HOME)/jre/lib/$(FIO_HDFS_CPU)/server -ljvm $(FIO_LIBHDFS_LIB)/libhdfs.a
+  HDFSLIB= -Wl,-rpath $(JAVA_HOME)/jre/lib/$(FIO_HDFS_CPU)/server -L$(JAVA_HOME)/jre/lib/$(FIO_HDFS_CPU)/server $(FIO_LIBHDFS_LIB)/libhdfs.a -ljvm
   CFLAGS += $(HDFSFLAGS)
   SOURCE += engines/libhdfs.c
 endif
 
-ifdef CONFIG_64BIT_LLP64
-  CFLAGS += -DBITS_PER_LONG=32
-endif
 ifdef CONFIG_64BIT
   CFLAGS += -DBITS_PER_LONG=64
 endif
@@ -95,9 +95,13 @@ endif
 ifdef CONFIG_WINDOWSAIO
   SOURCE += engines/windowsaio.c
 endif
+ifdef CONFIG_RADOS
+  SOURCE += engines/rados.c
+endif
 ifdef CONFIG_RBD
   SOURCE += engines/rbd.c
 endif
+SOURCE += oslib/asprintf.c
 ifndef CONFIG_STRSEP
   SOURCE += oslib/strsep.c
 endif
@@ -135,10 +139,13 @@ endif
 ifdef CONFIG_LINUX_DEVDAX
   SOURCE += engines/dev-dax.c
 endif
+ifdef CONFIG_LIBPMEM
+  SOURCE += engines/libpmem.c
+endif
 
 ifeq ($(CONFIG_TARGET_OS), Linux)
   SOURCE += diskutil.c fifo.c blktrace.c cgroup.c trim.c engines/sg.c \
-		engines/binject.c oslib/linux-dev-lookup.c
+		oslib/linux-dev-lookup.c
   LIBS += -lpthread -ldl
   LDFLAGS += -rdynamic
 endif
@@ -203,7 +210,8 @@ endif
 -include $(OBJS:.o=.d)
 
 T_SMALLOC_OBJS = t/stest.o
-T_SMALLOC_OBJS += gettime.o mutex.o smalloc.o t/log.o t/debug.o t/arch.o
+T_SMALLOC_OBJS += gettime.o fio_sem.o pshared.o smalloc.o t/log.o t/debug.o \
+		  t/arch.o
 T_SMALLOC_PROGS = t/stest
 
 T_IEEE_OBJS = t/ieee754.o
@@ -221,7 +229,8 @@ T_AXMAP_OBJS += lib/lfsr.o lib/axmap.o
 T_AXMAP_PROGS = t/axmap
 
 T_LFSR_TEST_OBJS = t/lfsr-test.o
-T_LFSR_TEST_OBJS += lib/lfsr.o gettime.o t/log.o t/debug.o t/arch.o
+T_LFSR_TEST_OBJS += lib/lfsr.o gettime.o fio_sem.o pshared.o \
+		    t/log.o t/debug.o t/arch.o
 T_LFSR_TEST_PROGS = t/lfsr-test
 
 T_GEN_RAND_OBJS = t/gen-rand.o
@@ -236,9 +245,10 @@ T_BTRACE_FIO_PROGS = t/fio-btrace2fio
 endif
 
 T_DEDUPE_OBJS = t/dedupe.o
-T_DEDUPE_OBJS += lib/rbtree.o t/log.o mutex.o smalloc.o gettime.o crc/md5.o \
-		lib/memalign.o lib/bloom.o t/debug.o crc/xxhash.o t/arch.o \
-		crc/murmur3.o crc/crc32c.o crc/crc32c-intel.o crc/crc32c-arm64.o crc/fnv.o
+T_DEDUPE_OBJS += lib/rbtree.o t/log.o fio_sem.o pshared.o smalloc.o gettime.o \
+		crc/md5.o lib/memalign.o lib/bloom.o t/debug.o crc/xxhash.o \
+		t/arch.o crc/murmur3.o crc/crc32c.o crc/crc32c-intel.o \
+		crc/crc32c-arm64.o crc/fnv.o
 T_DEDUPE_PROGS = t/fio-dedupe
 
 T_VS_OBJS = t/verify-state.o t/log.o crc/crc32c.o crc/crc32c-intel.o crc/crc32c-arm64.o t/debug.o
@@ -452,7 +462,7 @@ t/time-test: $(T_TT_OBJS)
 	$(QUIET_LINK)$(CC) $(LDFLAGS) $(CFLAGS) -o $@ $(T_TT_OBJS) $(LIBS)
 
 clean: FORCE
-	@rm -f .depend $(FIO_OBJS) $(GFIO_OBJS) $(OBJS) $(T_OBJS) $(PROGS) $(T_PROGS) $(T_TEST_PROGS) core.* core gfio FIO-VERSION-FILE *.d lib/*.d oslib/*.d crc/*.d engines/*.d profiles/*.d t/*.d config-host.mak config-host.h y.tab.[ch] lex.yy.c exp/*.[do] lexer.h
+	@rm -f .depend $(FIO_OBJS) $(GFIO_OBJS) $(OBJS) $(T_OBJS) $(PROGS) $(T_PROGS) $(T_TEST_PROGS) core.* core gfio FIO-VERSION-FILE *.[do] lib/*.d oslib/*.[do] crc/*.d engines/*.[do] profiles/*.[do] t/*.[do] config-host.mak config-host.h y.tab.[ch] lex.yy.c exp/*.[do] lexer.h
 	@rm -rf  doc/output
 
 distclean: clean FORCE

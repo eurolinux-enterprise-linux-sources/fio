@@ -1,12 +1,8 @@
 #include <unistd.h>
-#include <fcntl.h>
 #include <string.h>
-#include <signal.h>
-#include <time.h>
 #include <assert.h>
 
 #include "fio.h"
-#include "hash.h"
 #include "verify.h"
 #include "trim.h"
 #include "lib/rand.h"
@@ -81,11 +77,6 @@ static uint64_t last_block(struct thread_data *td, struct fio_file *f,
 	return max_blocks;
 }
 
-struct rand_off {
-	struct flist_head list;
-	uint64_t off;
-};
-
 static int __get_next_rand_offset(struct thread_data *td, struct fio_file *f,
 				  enum fio_ddir ddir, uint64_t *b,
 				  uint64_t lastb)
@@ -157,13 +148,69 @@ static int __get_next_rand_offset_gauss(struct thread_data *td,
 	return 0;
 }
 
+static int __get_next_rand_offset_zoned_abs(struct thread_data *td,
+					    struct fio_file *f,
+					    enum fio_ddir ddir, uint64_t *b)
+{
+	struct zone_split_index *zsi;
+	uint64_t lastb, send, stotal;
+	unsigned int v;
+
+	lastb = last_block(td, f, ddir);
+	if (!lastb)
+		return 1;
+
+	if (!td->o.zone_split_nr[ddir]) {
+bail:
+		return __get_next_rand_offset(td, f, ddir, b, lastb);
+	}
+
+	/*
+	 * Generate a value, v, between 1 and 100, both inclusive
+	 */
+	v = rand32_between(&td->zone_state, 1, 100);
+
+	/*
+	 * Find our generated table. 'send' is the end block of this zone,
+	 * 'stotal' is our start offset.
+	 */
+	zsi = &td->zone_state_index[ddir][v - 1];
+	stotal = zsi->size_prev / td->o.ba[ddir];
+	send = zsi->size / td->o.ba[ddir];
+
+	/*
+	 * Should never happen
+	 */
+	if (send == -1U) {
+		if (!fio_did_warn(FIO_WARN_ZONED_BUG))
+			log_err("fio: bug in zoned generation\n");
+		goto bail;
+	} else if (send > lastb) {
+		/*
+		 * This happens if the user specifies ranges that exceed
+		 * the file/device size. We can't handle that gracefully,
+		 * so error and exit.
+		 */
+		log_err("fio: zoned_abs sizes exceed file size\n");
+		return 1;
+	}
+
+	/*
+	 * Generate index from 0..send-stotal
+	 */
+	if (__get_next_rand_offset(td, f, ddir, b, send - stotal) == 1)
+		return 1;
+
+	*b += stotal;
+	return 0;
+}
+
 static int __get_next_rand_offset_zoned(struct thread_data *td,
 					struct fio_file *f, enum fio_ddir ddir,
 					uint64_t *b)
 {
 	unsigned int v, send, stotal;
 	uint64_t offset, lastb;
-	static int warned;
 	struct zone_split_index *zsi;
 
 	lastb = last_block(td, f, ddir);
@@ -188,10 +235,8 @@ bail:
 	 * Should never happen
 	 */
 	if (send == -1U) {
-		if (!warned) {
+		if (!fio_did_warn(FIO_WARN_ZONED_BUG))
 			log_err("fio: bug in zoned generation\n");
-			warned = 1;
-		}
 		goto bail;
 	}
 
@@ -222,16 +267,8 @@ bail:
 	return 0;
 }
 
-static int flist_cmp(void *data, struct flist_head *a, struct flist_head *b)
-{
-	struct rand_off *r1 = flist_entry(a, struct rand_off, list);
-	struct rand_off *r2 = flist_entry(b, struct rand_off, list);
-
-	return r1->off - r2->off;
-}
-
-static int get_off_from_method(struct thread_data *td, struct fio_file *f,
-			       enum fio_ddir ddir, uint64_t *b)
+static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
+				enum fio_ddir ddir, uint64_t *b)
 {
 	if (td->o.random_distribution == FIO_RAND_DIST_RANDOM) {
 		uint64_t lastb;
@@ -249,28 +286,11 @@ static int get_off_from_method(struct thread_data *td, struct fio_file *f,
 		return __get_next_rand_offset_gauss(td, f, ddir, b);
 	else if (td->o.random_distribution == FIO_RAND_DIST_ZONED)
 		return __get_next_rand_offset_zoned(td, f, ddir, b);
+	else if (td->o.random_distribution == FIO_RAND_DIST_ZONED_ABS)
+		return __get_next_rand_offset_zoned_abs(td, f, ddir, b);
 
 	log_err("fio: unknown random distribution: %d\n", td->o.random_distribution);
 	return 1;
-}
-
-/*
- * Sort the reads for a verify phase in batches of verifysort_nr, if
- * specified.
- */
-static inline bool should_sort_io(struct thread_data *td)
-{
-	if (!td->o.verifysort_nr || !td->o.do_verify)
-		return false;
-	if (!td_random(td))
-		return false;
-	if (td->runstate != TD_VERIFYING)
-		return false;
-	if (td->o.random_generator == FIO_RAND_GEN_TAUSWORTHE ||
-	    td->o.random_generator == FIO_RAND_GEN_TAUSWORTHE64)
-		return false;
-
-	return true;
 }
 
 static bool should_do_random(struct thread_data *td, enum fio_ddir ddir)
@@ -285,42 +305,15 @@ static bool should_do_random(struct thread_data *td, enum fio_ddir ddir)
 	return v <= td->o.perc_rand[ddir];
 }
 
-static int get_next_rand_offset(struct thread_data *td, struct fio_file *f,
-				enum fio_ddir ddir, uint64_t *b)
+static void loop_cache_invalidate(struct thread_data *td, struct fio_file *f)
 {
-	struct rand_off *r;
-	int i, ret = 1;
+	struct thread_options *o = &td->o;
 
-	if (!should_sort_io(td))
-		return get_off_from_method(td, f, ddir, b);
+	if (o->invalidate_cache && !o->odirect) {
+		int fio_unused ret;
 
-	if (!flist_empty(&td->next_rand_list)) {
-fetch:
-		r = flist_first_entry(&td->next_rand_list, struct rand_off, list);
-		flist_del(&r->list);
-		*b = r->off;
-		free(r);
-		return 0;
+		ret = file_invalidate_cache(td, f);
 	}
-
-	for (i = 0; i < td->o.verifysort_nr; i++) {
-		r = malloc(sizeof(*r));
-
-		ret = get_off_from_method(td, f, ddir, &r->off);
-		if (ret) {
-			free(r);
-			break;
-		}
-
-		flist_add(&r->list, &td->next_rand_list);
-	}
-
-	if (ret && !i)
-		return ret;
-
-	assert(!flist_empty(&td->next_rand_list));
-	flist_sort(NULL, &td->next_rand_list, flist_cmp);
-	goto fetch;
 }
 
 static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
@@ -332,6 +325,7 @@ static int get_next_rand_block(struct thread_data *td, struct fio_file *f,
 	if (td->o.time_based ||
 	    (td->o.file_service_type & __FIO_FSERVICE_NONUNIFORM)) {
 		fio_file_reset(td, f);
+		loop_cache_invalidate(td, f);
 		if (!get_next_rand_offset(td, f, ddir, b))
 			return 0;
 	}
@@ -349,21 +343,24 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 
 	assert(ddir_rw(ddir));
 
+	/*
+	 * If we reach the end for a time based run, reset us back to 0
+	 * and invalidate the cache, if we need to.
+	 */
 	if (f->last_pos[ddir] >= f->io_size + get_start_offset(td, f) &&
 	    o->time_based) {
-		struct thread_options *o = &td->o;
-		uint64_t io_size = f->io_size + (f->io_size % o->min_bs[ddir]);
-
-		if (io_size > f->last_pos[ddir])
-			f->last_pos[ddir] = 0;
-		else
-			f->last_pos[ddir] = f->last_pos[ddir] - io_size;
+		f->last_pos[ddir] = f->file_offset;
+		loop_cache_invalidate(td, f);
 	}
 
 	if (f->last_pos[ddir] < f->real_file_size) {
 		uint64_t pos;
 
-		if (f->last_pos[ddir] == f->file_offset && o->ddir_seq_add < 0) {
+		/*
+		 * Only rewind if we already hit the end
+		 */
+		if (f->last_pos[ddir] == f->file_offset &&
+		    f->file_offset && o->ddir_seq_add < 0) {
 			if (f->real_file_size > f->io_size)
 				f->last_pos[ddir] = f->io_size;
 			else
@@ -403,7 +400,7 @@ static int get_next_seq_offset(struct thread_data *td, struct fio_file *f,
 
 static int get_next_block(struct thread_data *td, struct io_u *io_u,
 			  enum fio_ddir ddir, int rw_seq,
-			  unsigned int *is_random)
+			  bool *is_random)
 {
 	struct fio_file *f = io_u->file;
 	uint64_t b, offset;
@@ -417,27 +414,27 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
 		if (td_random(td)) {
 			if (should_do_random(td, ddir)) {
 				ret = get_next_rand_block(td, f, ddir, &b);
-				*is_random = 1;
+				*is_random = true;
 			} else {
-				*is_random = 0;
+				*is_random = false;
 				io_u_set(td, io_u, IO_U_F_BUSY_OK);
 				ret = get_next_seq_offset(td, f, ddir, &offset);
 				if (ret)
 					ret = get_next_rand_block(td, f, ddir, &b);
 			}
 		} else {
-			*is_random = 0;
+			*is_random = false;
 			ret = get_next_seq_offset(td, f, ddir, &offset);
 		}
 	} else {
 		io_u_set(td, io_u, IO_U_F_BUSY_OK);
-		*is_random = 0;
+		*is_random = false;
 
 		if (td->o.rw_seq == RW_SEQ_SEQ) {
 			ret = get_next_seq_offset(td, f, ddir, &offset);
 			if (ret) {
 				ret = get_next_rand_block(td, f, ddir, &b);
-				*is_random = 0;
+				*is_random = false;
 			}
 		} else if (td->o.rw_seq == RW_SEQ_IDENT) {
 			if (f->last_start[ddir] != -1ULL)
@@ -470,8 +467,8 @@ static int get_next_block(struct thread_data *td, struct io_u *io_u,
  * until we find a free one. For sequential io, just return the end of
  * the last io issued.
  */
-static int __get_next_offset(struct thread_data *td, struct io_u *io_u,
-			     unsigned int *is_random)
+static int get_next_offset(struct thread_data *td, struct io_u *io_u,
+			   bool *is_random)
 {
 	struct fio_file *f = io_u->file;
 	enum fio_ddir ddir = io_u->ddir;
@@ -505,19 +502,6 @@ static int __get_next_offset(struct thread_data *td, struct io_u *io_u,
 	return 0;
 }
 
-static int get_next_offset(struct thread_data *td, struct io_u *io_u,
-			   unsigned int *is_random)
-{
-	if (td->flags & TD_F_PROFILE_OPS) {
-		struct prof_io_ops *ops = &td->prof_io_ops;
-
-		if (ops->fill_io_u_off)
-			return ops->fill_io_u_off(td, io_u, is_random);
-	}
-
-	return __get_next_offset(td, io_u, is_random);
-}
-
 static inline bool io_u_fits(struct thread_data *td, struct io_u *io_u,
 			     unsigned int buflen)
 {
@@ -526,8 +510,8 @@ static inline bool io_u_fits(struct thread_data *td, struct io_u *io_u,
 	return io_u->offset + buflen <= f->io_size + get_start_offset(td, f);
 }
 
-static unsigned int __get_next_buflen(struct thread_data *td, struct io_u *io_u,
-				      unsigned int is_random)
+static unsigned int get_next_buflen(struct thread_data *td, struct io_u *io_u,
+				    bool is_random)
 {
 	int ddir = io_u->ddir;
 	unsigned int buflen = 0;
@@ -538,7 +522,7 @@ static unsigned int __get_next_buflen(struct thread_data *td, struct io_u *io_u,
 	assert(ddir_rw(ddir));
 
 	if (td->o.bs_is_seq_rand)
-		ddir = is_random ? DDIR_WRITE: DDIR_READ;
+		ddir = is_random ? DDIR_WRITE : DDIR_READ;
 
 	minbs = td->o.min_bs[ddir];
 	maxbs = td->o.max_bs[ddir];
@@ -588,19 +572,6 @@ static unsigned int __get_next_buflen(struct thread_data *td, struct io_u *io_u,
 	return buflen;
 }
 
-static unsigned int get_next_buflen(struct thread_data *td, struct io_u *io_u,
-				    unsigned int is_random)
-{
-	if (td->flags & TD_F_PROFILE_OPS) {
-		struct prof_io_ops *ops = &td->prof_io_ops;
-
-		if (ops->fill_io_u_size)
-			return ops->fill_io_u_size(td, io_u, is_random);
-	}
-
-	return __get_next_buflen(td, io_u, is_random);
-}
-
 static void set_rwmix_bytes(struct thread_data *td)
 {
 	unsigned int diff;
@@ -639,11 +610,8 @@ int io_u_quiesce(struct thread_data *td)
 	 * io's that have been actually submitted to an async engine,
 	 * and cur_depth is meaningless for sync engines.
 	 */
-	if (td->io_u_queued || td->cur_depth) {
-		int fio_unused ret;
-
-		ret = td_io_commit(td);
-	}
+	if (td->io_u_queued || td->cur_depth)
+		td_io_commit(td);
 
 	while (td->io_u_in_flight) {
 		int ret;
@@ -662,7 +630,7 @@ int io_u_quiesce(struct thread_data *td)
 static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 {
 	enum fio_ddir odir = ddir ^ 1;
-	long usec;
+	uint64_t usec;
 	uint64_t now;
 
 	assert(ddir_rw(ddir));
@@ -686,11 +654,11 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 			return odir;
 
 		/*
-		 * Both directions are ahead of rate. sleep the min
-		 * switch if necissary
+		 * Both directions are ahead of rate. sleep the min,
+		 * switch if necessary
 		 */
 		if (td->rate_next_io_time[ddir] <=
-			td->rate_next_io_time[odir]) {
+		    td->rate_next_io_time[odir]) {
 			usec = td->rate_next_io_time[ddir] - now;
 		} else {
 			usec = td->rate_next_io_time[odir] - now;
@@ -702,8 +670,7 @@ static enum fio_ddir rate_ddir(struct thread_data *td, enum fio_ddir ddir)
 	if (td->o.io_submit_mode == IO_MODE_INLINE)
 		io_u_quiesce(td);
 
-	usec = usec_sleep(td, usec);
-
+	usec_sleep(td, usec);
 	return ddir;
 }
 
@@ -812,8 +779,8 @@ void put_io_u(struct thread_data *td, struct io_u *io_u)
 		assert(!(td->flags & TD_F_CHILD));
 	}
 	io_u_qpush(&td->io_u_freelist, io_u);
-	td_io_u_unlock(td);
 	td_io_u_free_notify(td);
+	td_io_u_unlock(td);
 }
 
 void clear_io_u(struct thread_data *td, struct io_u *io_u)
@@ -845,14 +812,53 @@ void requeue_io_u(struct thread_data *td, struct io_u **io_u)
 	}
 
 	io_u_rpush(&td->io_u_requeues, __io_u);
-	td_io_u_unlock(td);
 	td_io_u_free_notify(td);
+	td_io_u_unlock(td);
 	*io_u = NULL;
+}
+
+static void __fill_io_u_zone(struct thread_data *td, struct io_u *io_u)
+{
+	struct fio_file *f = io_u->file;
+
+	/*
+	 * See if it's time to switch to a new zone
+	 */
+	if (td->zone_bytes >= td->o.zone_size && td->o.zone_skip) {
+		td->zone_bytes = 0;
+		f->file_offset += td->o.zone_range + td->o.zone_skip;
+
+		/*
+		 * Wrap from the beginning, if we exceed the file size
+		 */
+		if (f->file_offset >= f->real_file_size)
+			f->file_offset = f->real_file_size - f->file_offset;
+		f->last_pos[io_u->ddir] = f->file_offset;
+		td->io_skip_bytes += td->o.zone_skip;
+	}
+
+	/*
+ 	 * If zone_size > zone_range, then maintain the same zone until
+ 	 * zone_bytes >= zone_size.
+ 	 */
+	if (f->last_pos[io_u->ddir] >= (f->file_offset + td->o.zone_range)) {
+		dprint(FD_IO, "io_u maintain zone offset=%" PRIu64 "/last_pos=%" PRIu64 "\n",
+				f->file_offset, f->last_pos[io_u->ddir]);
+		f->last_pos[io_u->ddir] = f->file_offset;
+	}
+
+	/*
+	 * For random: if 'norandommap' is not set and zone_size > zone_range,
+	 * map needs to be reset as it's done with zone_range everytime.
+	 */
+	if ((td->zone_bytes % td->o.zone_range) == 0) {
+		fio_file_reset(td, f);
+	}
 }
 
 static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 {
-	unsigned int is_random;
+	bool is_random;
 
 	if (td_ioengine_flagged(td, FIO_NOIO))
 		goto out;
@@ -866,21 +872,10 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 		goto out;
 
 	/*
-	 * See if it's time to switch to a new zone
+	 * When file is zoned zone_range is always positive
 	 */
-	if (td->zone_bytes >= td->o.zone_size && td->o.zone_skip) {
-		struct fio_file *f = io_u->file;
-
-		td->zone_bytes = 0;
-		f->file_offset += td->o.zone_range + td->o.zone_skip;
-
-		/*
-		 * Wrap from the beginning, if we exceed the file size
-		 */
-		if (f->file_offset >= f->real_file_size)
-			f->file_offset = f->real_file_size - f->file_offset;
-		f->last_pos[io_u->ddir] = f->file_offset;
-		td->io_skip_bytes += td->o.zone_skip;
+	if (td->o.zone_range) {
+		__fill_io_u_zone(td, io_u);
 	}
 
 	/*
@@ -899,9 +894,8 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 	}
 
 	if (io_u->offset + io_u->buflen > io_u->file->real_file_size) {
-		dprint(FD_IO, "io_u %p, offset + buflen exceeds file size\n",
-			io_u);
-		dprint(FD_IO, "  offset=%llu/buflen=%lu > %llu\n",
+		dprint(FD_IO, "io_u %p, off=0x%llx + len=0x%lx exceeds file size=0x%llx\n",
+			io_u,
 			(unsigned long long) io_u->offset, io_u->buflen,
 			(unsigned long long) io_u->file->real_file_size);
 		return 1;
@@ -914,12 +908,12 @@ static int fill_io_u(struct thread_data *td, struct io_u *io_u)
 		mark_random_map(td, io_u);
 
 out:
-	dprint_io_u(io_u, "fill_io_u");
+	dprint_io_u(io_u, "fill");
 	td->zone_bytes += io_u->buflen;
 	return 0;
 }
 
-static void __io_u_mark_map(unsigned int *map, unsigned int nr)
+static void __io_u_mark_map(uint64_t *map, unsigned int nr)
 {
 	int idx = 0;
 
@@ -1294,13 +1288,6 @@ out:
 
 static struct fio_file *get_next_file(struct thread_data *td)
 {
-	if (td->flags & TD_F_PROFILE_OPS) {
-		struct prof_io_ops *ops = &td->prof_io_ops;
-
-		if (ops->get_next_file)
-			return ops->get_next_file(td);
-	}
-
 	return __get_next_file(td);
 }
 
@@ -1336,10 +1323,10 @@ static long set_io_u_file(struct thread_data *td, struct io_u *io_u)
 }
 
 static void lat_fatal(struct thread_data *td, struct io_completion_data *icd,
-		      unsigned long tusec, unsigned long max_usec)
+		      unsigned long long tnsec, unsigned long long max_nsec)
 {
 	if (!td->error)
-		log_err("fio: latency of %lu usec exceeds specified max (%lu usec)\n", tusec, max_usec);
+		log_err("fio: latency of %llu nsec exceeds specified max (%llu nsec)\n", tnsec, max_nsec);
 	td_verror(td, ETIMEDOUT, "max latency exceeded");
 	icd->error = ETIMEDOUT;
 }
@@ -1494,6 +1481,7 @@ bool queue_full(const struct thread_data *td)
 struct io_u *__get_io_u(struct thread_data *td)
 {
 	struct io_u *io_u = NULL;
+	int ret;
 
 	if (td->stop_io)
 		return NULL;
@@ -1530,7 +1518,8 @@ again:
 		 * return one
 		 */
 		assert(!(td->flags & TD_F_CHILD));
-		assert(!pthread_cond_wait(&td->free_cond, &td->io_u_lock));
+		ret = pthread_cond_wait(&td->free_cond, &td->io_u_lock);
+		assert(ret == 0);
 		goto again;
 	}
 
@@ -1542,22 +1531,19 @@ static bool check_get_trim(struct thread_data *td, struct io_u *io_u)
 {
 	if (!(td->flags & TD_F_TRIM_BACKLOG))
 		return false;
+	if (!td->trim_entries)
+		return false;
 
-	if (td->trim_entries) {
-		int get_trim = 0;
-
-		if (td->trim_batch) {
-			td->trim_batch--;
-			get_trim = 1;
-		} else if (!(td->io_hist_len % td->o.trim_backlog) &&
-			 td->last_ddir != DDIR_READ) {
-			td->trim_batch = td->o.trim_batch;
-			if (!td->trim_batch)
-				td->trim_batch = td->o.trim_backlog;
-			get_trim = 1;
-		}
-
-		if (get_trim && get_next_trim(td, io_u))
+	if (td->trim_batch) {
+		td->trim_batch--;
+		if (get_next_trim(td, io_u))
+			return true;
+	} else if (!(td->io_hist_len % td->o.trim_backlog) &&
+		     td->last_ddir != DDIR_READ) {
+		td->trim_batch = td->o.trim_batch;
+		if (!td->trim_batch)
+			td->trim_batch = td->o.trim_backlog;
+		if (get_next_trim(td, io_u))
 			return true;
 	}
 
@@ -1599,32 +1585,40 @@ static bool check_get_verify(struct thread_data *td, struct io_u *io_u)
  */
 static void small_content_scramble(struct io_u *io_u)
 {
-	unsigned int i, nr_blocks = io_u->buflen / 512;
-	uint64_t boffset;
+	unsigned int i, nr_blocks = io_u->buflen >> 9;
 	unsigned int offset;
-	char *p, *end;
+	uint64_t boffset, *iptr;
+	char *p;
 
 	if (!nr_blocks)
 		return;
 
 	p = io_u->xfer_buf;
 	boffset = io_u->offset;
-	io_u->buf_filled_len = 0;
+
+	if (io_u->buf_filled_len)
+		io_u->buf_filled_len = 0;
+
+	/*
+	 * Generate random index between 0..7. We do chunks of 512b, if
+	 * we assume a cacheline is 64 bytes, then we have 8 of those.
+	 * Scramble content within the blocks in the same cacheline to
+	 * speed things up.
+	 */
+	offset = (io_u->start_time.tv_nsec ^ boffset) & 7;
 
 	for (i = 0; i < nr_blocks; i++) {
 		/*
-		 * Fill the byte offset into a "random" start offset of
-		 * the buffer, given by the product of the usec time
-		 * and the actual offset.
+		 * Fill offset into start of cacheline, time into end
+		 * of cacheline
 		 */
-		offset = ((io_u->start_time.tv_nsec/1000) ^ boffset) & 511;
-		offset &= ~(sizeof(uint64_t) - 1);
-		if (offset >= 512 - sizeof(uint64_t))
-			offset -= sizeof(uint64_t);
-		memcpy(p + offset, &boffset, sizeof(boffset));
+		iptr = (void *) p + (offset << 6);
+		*iptr = boffset;
 
-		end = p + 512 - sizeof(io_u->start_time);
-		memcpy(end, &io_u->start_time, sizeof(io_u->start_time));
+		iptr = (void *) p + 64 - 2 * sizeof(uint64_t);
+		iptr[0] = io_u->start_time.tv_sec;
+		iptr[1] = io_u->start_time.tv_nsec;
+
 		p += 512;
 		boffset += 512;
 	}
@@ -1632,7 +1626,7 @@ static void small_content_scramble(struct io_u *io_u)
 
 /*
  * Return an io_u to be processed. Gets a buflen and offset, sets direction,
- * etc. The returned io_u is fully ready to be prepped and submitted.
+ * etc. The returned io_u is fully ready to be prepped, populated and submitted.
  */
 struct io_u *get_io_u(struct thread_data *td)
 {
@@ -1693,12 +1687,9 @@ struct io_u *get_io_u(struct thread_data *td)
 					td->o.min_bs[DDIR_WRITE],
 					io_u->buflen);
 			} else if ((td->flags & TD_F_SCRAMBLE_BUFFERS) &&
-				   !(td->flags & TD_F_COMPRESS))
+				   !(td->flags & TD_F_COMPRESS) &&
+				   !(td->flags & TD_F_DO_VERIFY))
 				do_scramble = 1;
-			if (td->flags & TD_F_VER_NONE) {
-				populate_verify_io_u(td, io_u);
-				do_scramble = 0;
-			}
 		} else if (io_u->ddir == DDIR_READ) {
 			/*
 			 * Reset the buf_filled parameters so next time if the
@@ -1779,7 +1770,7 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 	if (td->parent)
 		td = td->parent;
 
-	if (!td->o.stats)
+	if (!td->o.stats || td_ioengine_flagged(td, FIO_NOSTATS))
 		return;
 
 	if (no_reduce)
@@ -1795,14 +1786,14 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 			struct prof_io_ops *ops = &td->prof_io_ops;
 
 			if (ops->io_u_lat)
-				icd->error = ops->io_u_lat(td, tnsec/1000);
+				icd->error = ops->io_u_lat(td, tnsec);
 		}
 
-		if (td->o.max_latency && tnsec/1000 > td->o.max_latency)
-			lat_fatal(td, icd, tnsec/1000, td->o.max_latency);
-		if (td->o.latency_target && tnsec/1000 > td->o.latency_target) {
+		if (td->o.max_latency && tnsec > td->o.max_latency)
+			lat_fatal(td, icd, tnsec, td->o.max_latency);
+		if (td->o.latency_target && tnsec > td->o.latency_target) {
 			if (lat_target_failed(td))
-				lat_fatal(td, icd, tnsec/1000, td->o.latency_target);
+				lat_fatal(td, icd, tnsec, td->o.latency_target);
 		}
 	}
 
@@ -1817,7 +1808,8 @@ static void account_io_completion(struct thread_data *td, struct io_u *io_u,
 
 		if (no_reduce && per_unit_log(td->iops_log))
 			add_iops_sample(td, io_u, bytes);
-	}
+	} else if (ddir_sync(idx) && !td->o.disable_clat)
+		add_sync_clat_sample(&td->ts, llnsec);
 
 	if (td->ts.nr_block_infos && io_u->ddir == DDIR_TRIM) {
 		uint32_t *info = io_u_block_info(td, io_u);
@@ -1855,6 +1847,12 @@ static void file_log_write_comp(const struct thread_data *td, struct fio_file *f
 		f->last_write_idx = 0;
 }
 
+static bool should_account(struct thread_data *td)
+{
+	return ramp_time_over(td) && (td->runstate == TD_RUNNING ||
+					   td->runstate == TD_VERIFYING);
+}
+
 static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 			 struct io_completion_data *icd)
 {
@@ -1862,7 +1860,7 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 	enum fio_ddir ddir = io_u->ddir;
 	struct fio_file *f = io_u->file;
 
-	dprint_io_u(io_u, "io complete");
+	dprint_io_u(io_u, "complete");
 
 	assert(io_u->flags & IO_U_F_FLIGHT);
 	io_u_clear(td, io_u, IO_U_F_FLIGHT | IO_U_F_BUSY_OK);
@@ -1883,15 +1881,17 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 	}
 
 	if (ddir_sync(ddir)) {
-		td->last_was_sync = 1;
+		td->last_was_sync = true;
 		if (f) {
 			f->first_write = -1ULL;
 			f->last_write = -1ULL;
 		}
+		if (should_account(td))
+			account_io_completion(td, io_u, icd, ddir, io_u->buflen);
 		return;
 	}
 
-	td->last_was_sync = 0;
+	td->last_was_sync = false;
 	td->last_ddir = ddir;
 
 	if (!io_u->error && ddir_rw(ddir)) {
@@ -1899,17 +1899,17 @@ static void io_completed(struct thread_data *td, struct io_u **io_u_ptr,
 		int ret;
 
 		td->io_blocks[ddir]++;
-		td->this_io_blocks[ddir]++;
 		td->io_bytes[ddir] += bytes;
 
-		if (!(io_u->flags & IO_U_F_VER_LIST))
+		if (!(io_u->flags & IO_U_F_VER_LIST)) {
+			td->this_io_blocks[ddir]++;
 			td->this_io_bytes[ddir] += bytes;
+		}
 
 		if (ddir == DDIR_WRITE)
 			file_log_write_comp(td, f, io_u->offset, bytes);
 
-		if (ramp_time_over(td) && (td->runstate == TD_RUNNING ||
-					   td->runstate == TD_VERIFYING))
+		if (should_account(td))
 			account_io_completion(td, io_u, icd, ddir, bytes);
 
 		icd->bytes_done[ddir] += bytes;

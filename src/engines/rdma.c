@@ -30,7 +30,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <sys/poll.h>
+#include <poll.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -59,6 +59,7 @@ struct rdmaio_options {
 	struct thread_data *td;
 	unsigned int port;
 	enum rdma_io_mode verb;
+	char *bindname;
 };
 
 static int str_hostname_cb(void *data, const char *input)
@@ -78,6 +79,16 @@ static struct fio_option options[] = {
 		.type	= FIO_OPT_STR_STORE,
 		.cb	= str_hostname_cb,
 		.help	= "Hostname for RDMA IO engine",
+		.category = FIO_OPT_C_ENGINE,
+		.group	= FIO_OPT_G_RDMA,
+	},
+	{
+		.name	= "bindname",
+		.lname	= "rdma engine bindname",
+		.type	= FIO_OPT_STR_STORE,
+		.off1	= offsetof(struct rdmaio_options, bindname),
+		.help	= "Bind for RDMA IO engine",
+		.def    = "",
 		.category = FIO_OPT_C_ENGINE,
 		.group	= FIO_OPT_G_RDMA,
 	},
@@ -780,7 +791,8 @@ static int fio_rdmaio_recv(struct thread_data *td, struct io_u **io_us,
 	return i;
 }
 
-static int fio_rdmaio_queue(struct thread_data *td, struct io_u *io_u)
+static enum fio_q_status fio_rdmaio_queue(struct thread_data *td,
+					  struct io_u *io_u)
 {
 	struct rdmaio_data *rd = td->io_ops_data;
 
@@ -1004,17 +1016,10 @@ static int fio_rdmaio_close_file(struct thread_data *td, struct fio_file *f)
 	return 0;
 }
 
-static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
-				    unsigned short port)
+static int aton(struct thread_data *td, const char *host,
+		     struct sockaddr_in *addr)
 {
-	struct rdmaio_data *rd = td->io_ops_data;
-	struct ibv_recv_wr *bad_wr;
-	int err;
-
-	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_port = htons(port);
-
-	if (inet_aton(host, &rd->addr.sin_addr) != 1) {
+	if (inet_aton(host, &addr->sin_addr) != 1) {
 		struct hostent *hent;
 
 		hent = gethostbyname(host);
@@ -1023,11 +1028,41 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 			return 1;
 		}
 
-		memcpy(&rd->addr.sin_addr, hent->h_addr, 4);
+		memcpy(&addr->sin_addr, hent->h_addr, 4);
 	}
+	return 0;
+}
+
+static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
+				    unsigned short port)
+{
+	struct rdmaio_data *rd = td->io_ops_data;
+	struct rdmaio_options *o = td->eo;
+	struct sockaddr_storage addrb;
+	struct ibv_recv_wr *bad_wr;
+	int err;
+
+	rd->addr.sin_family = AF_INET;
+	rd->addr.sin_port = htons(port);
+
+	err = aton(td, host, &rd->addr);
+	if (err)
+		return err;
 
 	/* resolve route */
-	err = rdma_resolve_addr(rd->cm_id, NULL, (struct sockaddr *)&rd->addr, 2000);
+	if (strcmp(o->bindname, "") != 0) {
+		addrb.ss_family = AF_INET;
+		err = aton(td, o->bindname, (struct sockaddr_in *)&addrb);
+		if (err)
+			return err;
+		err = rdma_resolve_addr(rd->cm_id, (struct sockaddr *)&addrb,
+					(struct sockaddr *)&rd->addr, 2000);
+
+	} else {
+		err = rdma_resolve_addr(rd->cm_id, NULL,
+					(struct sockaddr *)&rd->addr, 2000);
+	}
+
 	if (err != 0) {
 		log_err("fio: rdma_resolve_addr: %d\n", err);
 		return 1;
@@ -1072,14 +1107,19 @@ static int fio_rdmaio_setup_connect(struct thread_data *td, const char *host,
 static int fio_rdmaio_setup_listen(struct thread_data *td, short port)
 {
 	struct rdmaio_data *rd = td->io_ops_data;
+	struct rdmaio_options *o = td->eo;
 	struct ibv_recv_wr *bad_wr;
 	int state = td->runstate;
 
 	td_set_runstate(td, TD_SETTING_UP);
 
 	rd->addr.sin_family = AF_INET;
-	rd->addr.sin_addr.s_addr = htonl(INADDR_ANY);
 	rd->addr.sin_port = htons(port);
+
+	if (strcmp(o->bindname, "") == 0)
+		rd->addr.sin_addr.s_addr = htonl(INADDR_ANY);
+	else
+		rd->addr.sin_addr.s_addr = htonl(*o->bindname);
 
 	/* rdma_listen */
 	if (rdma_bind_addr(rd->cm_id, (struct sockaddr *)&rd->addr) != 0) {
@@ -1155,7 +1195,8 @@ static int compat_options(struct thread_data *td)
 {
 	// The original RDMA engine had an ugly / seperator
 	// on the filename for it's options. This function
-	// retains backwards compatibility with it.100
+	// retains backwards compatibility with it. Note we do not
+	// support setting the bindname option is this legacy mode.
 
 	struct rdmaio_options *o = td->eo;
 	char *modep, *portp;

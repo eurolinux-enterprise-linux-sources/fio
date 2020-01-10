@@ -2,20 +2,14 @@
  * Clock functions
  */
 
-#include <unistd.h>
 #include <math.h>
-#include <sys/time.h>
-#include <time.h>
 
 #include "fio.h"
-#include "smalloc.h"
-
-#include "hash.h"
 #include "os/os.h"
 
 #if defined(ARCH_HAVE_CPU_CLOCK)
 #ifndef ARCH_CPU_CLOCK_CYCLES_PER_USEC
-static unsigned long cycles_per_msec;
+static unsigned long long cycles_per_msec;
 static unsigned long long cycles_start;
 static unsigned long long clock_mult;
 static unsigned long long max_cycles_mask;
@@ -448,6 +442,14 @@ uint64_t ntime_since(const struct timespec *s, const struct timespec *e)
        return nsec + (sec * 1000000000LL);
 }
 
+uint64_t ntime_since_now(const struct timespec *s)
+{
+	struct timespec now;
+
+	fio_gettime(&now, NULL);
+	return ntime_since(s, &now);
+}
+
 uint64_t utime_since(const struct timespec *s, const struct timespec *e)
 {
 	int64_t sec, usec;
@@ -540,7 +542,7 @@ uint64_t time_since_now(const struct timespec *s)
 }
 
 #if defined(FIO_HAVE_CPU_AFFINITY) && defined(ARCH_HAVE_CPU_CLOCK)  && \
-    defined(CONFIG_SFAA)
+    defined(CONFIG_SYNC_SYNC) && defined(CONFIG_CMP_SWAP)
 
 #define CLOCK_ENTRIES_DEBUG	100000
 #define CLOCK_ENTRIES_TEST	1000
@@ -555,16 +557,16 @@ struct clock_thread {
 	pthread_t thread;
 	int cpu;
 	int debug;
-	pthread_mutex_t lock;
-	pthread_mutex_t started;
+	struct fio_sem lock;
 	unsigned long nr_entries;
 	uint32_t *seq;
 	struct clock_entry *entries;
 };
 
-static inline uint32_t atomic32_inc_return(uint32_t *seq)
+static inline uint32_t atomic32_compare_and_swap(uint32_t *ptr, uint32_t old,
+						 uint32_t new)
 {
-	return 1 + __sync_fetch_and_add(seq, 1);
+	return __sync_val_compare_and_swap(ptr, old, new);
 }
 
 static void *clock_thread_fn(void *data)
@@ -572,7 +574,6 @@ static void *clock_thread_fn(void *data)
 	struct clock_thread *t = data;
 	struct clock_entry *c;
 	os_cpu_mask_t cpu_mask;
-	uint32_t last_seq;
 	unsigned long long first;
 	int i;
 
@@ -592,11 +593,9 @@ static void *clock_thread_fn(void *data)
 		goto err;
 	}
 
-	pthread_mutex_lock(&t->lock);
-	pthread_mutex_unlock(&t->started);
+	fio_sem_down(&t->lock);
 
 	first = get_cpu_clock();
-	last_seq = 0;
 	c = &t->entries[0];
 	for (i = 0; i < t->nr_entries; i++, c++) {
 		uint32_t seq;
@@ -604,11 +603,15 @@ static void *clock_thread_fn(void *data)
 
 		c->cpu = t->cpu;
 		do {
-			seq = atomic32_inc_return(t->seq);
-			if (seq < last_seq)
+			seq = *t->seq;
+			if (seq == UINT_MAX)
 				break;
+			__sync_synchronize();
 			tsc = get_cpu_clock();
-		} while (seq != *t->seq);
+		} while (seq != atomic32_compare_and_swap(t->seq, seq, seq + 1));
+
+		if (seq == UINT_MAX)
+			break;
 
 		c->seq = seq;
 		c->tsc = tsc;
@@ -626,7 +629,7 @@ static void *clock_thread_fn(void *data)
 	 * The most common platform clock breakage is returning zero
 	 * indefinitely. Check for that and return failure.
 	 */
-	if (!t->entries[i - 1].tsc && !t->entries[0].tsc)
+	if (i > 1 && !t->entries[i - 1].tsc && !t->entries[0].tsc)
 		goto err;
 
 	fio_cpuset_exit(&cpu_mask);
@@ -691,9 +694,7 @@ int fio_monotonic_clocktest(int debug)
 		t->seq = &seq;
 		t->nr_entries = nr_entries;
 		t->entries = &entries[i * nr_entries];
-		pthread_mutex_init(&t->lock, NULL);
-		pthread_mutex_init(&t->started, NULL);
-		pthread_mutex_lock(&t->lock);
+		__fio_sem_init(&t->lock, FIO_SEM_LOCKED);
 		if (pthread_create(&t->thread, NULL, clock_thread_fn, t)) {
 			failed++;
 			nr_cpus = i;
@@ -704,13 +705,7 @@ int fio_monotonic_clocktest(int debug)
 	for (i = 0; i < nr_cpus; i++) {
 		struct clock_thread *t = &cthreads[i];
 
-		pthread_mutex_lock(&t->started);
-	}
-
-	for (i = 0; i < nr_cpus; i++) {
-		struct clock_thread *t = &cthreads[i];
-
-		pthread_mutex_unlock(&t->lock);
+		fio_sem_up(&t->lock);
 	}
 
 	for (i = 0; i < nr_cpus; i++) {
@@ -720,6 +715,7 @@ int fio_monotonic_clocktest(int debug)
 		pthread_join(t->thread, &ret);
 		if (ret)
 			failed++;
+		__fio_sem_remove(&t->lock);
 	}
 	free(cthreads);
 
